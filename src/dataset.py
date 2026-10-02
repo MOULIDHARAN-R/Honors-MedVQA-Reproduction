@@ -1,423 +1,199 @@
+"""
+dataset.py  (place at MedVqa/src/dataset.py)
+
+PyTorch data pipeline for the VGG-16 + BERT + concatenation reproduction.
+
+  * Reads the frozen CSV as raw strings and the saved split JSON (row indices).
+  * Verifies the CSV hash recorded in the split file, that train/test are disjoint,
+    and (for image splits) that no image occurs on both sides.
+  * Answer handling is defined in answers.py ('#' alternatives, optional "(...)" text):
+        - vocabulary = one class per TRAINING answer (first '#' alternative, literal)
+        - every test row keeps ALL accepted class ids (alt_ids, padded with -1)
+        - a prediction is correct if it is in alt_ids; rows with no accepted class in the
+          vocabulary can never be correct and stay in the denominator.
+  * Questions are pre-tokenised once with the BERT tokenizer from the config.
+  * Augmentation is applied to TRAIN images only (values from config).
+"""
+import hashlib
+import json
 from pathlib import Path
+
 import pandas as pd
+import torch
+from PIL import Image
+from torch.utils.data import Dataset
+from torchvision import transforms
+
+from .answers import AnswerVocab, parenthesized_answers
+from .config import Config, CFG, PROJECT_ROOT
 
 
 # ============================================================
-# Paths
+# Helpers
 # ============================================================
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-
-RAW_DIR = PROJECT_ROOT / "data" / "raw"
-PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
-
-TRAIN_DIR = RAW_DIR / "ImageClef-2019-VQA-Med-Training"
-VAL_DIR = RAW_DIR / "ImageClef-2019-VQA-Med-Validation"
-TEST_DIR = RAW_DIR / "VQAMed2019Test"
-
-OUTPUT_FILE = PROCESSED_DIR / "all_qa_pairs.csv"
+def file_md5(path: Path) -> str:
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
-# ============================================================
-# Helper functions
-# ============================================================
-
-def parse_train_val_file(file_path, image_dir, source):
-    """
-    Parse the VQA-Med training/validation QA files.
-
-    Expected format:
-        image_id|question|answer
-    """
-
-    rows = []
-
-    with open(file_path, "r", encoding="utf-8") as f:
-        for line_number, line in enumerate(f, start=1):
-
-            line = line.strip()
-
-            if not line:
-                continue
-
-            parts = line.split("|", maxsplit=2)
-
-            if len(parts) != 3:
-                print(
-                    f"WARNING: Could not parse {file_path.name} "
-                    f"line {line_number}: {line}"
-                )
-                continue
-
-            image_id, question, answer = parts
-
-            image_id = image_id.strip()
-            question = question.strip()
-            answer = answer.strip()
-
-            image_path = image_dir / f"{image_id}.jpg"
-
-            rows.append({
-                "image_id": image_id,
-                "question": question,
-                "answer": answer,
-                "category": None,
-                "image_path": str(image_path),
-                "source": source,
-            })
-
-    return rows
+def load_dataframe(cfg: Config = CFG) -> pd.DataFrame:
+    # raw strings only: "None"/"NA" answers must not become NaN
+    return pd.read_csv(cfg.csv_path, dtype=str, keep_default_na=False)
 
 
-def parse_test_file(file_path, image_dir):
-    """
-    Parse the VQA-Med 2019 test reference-answer file.
+def load_split(cfg: Config, k: int, df: pd.DataFrame):
+    """Load split k (1-based), validate it against the current CSV, return (train_idx, test_idx, meta)."""
+    with open(cfg.split_file(k), "r") as f:
+        split = json.load(f)
 
-    Expected format:
-        image_id|category|question|reference_answer
+    current_md5 = file_md5(cfg.csv_path)
+    if split["csv_md5"] != current_md5:
+        raise RuntimeError(
+            f"CSV changed since split {k} was created "
+            f"({split['csv_md5']} != {current_md5}). Regenerate the splits.")
+    if split["n_total_rows"] != len(df):
+        raise RuntimeError("Row count of CSV does not match the split file.")
 
-    Multiple acceptable answers are preserved using '#'.
-    Optional-answer notation is also preserved exactly.
-    """
+    train_idx, test_idx = split["train_idx"], split["test_idx"]
+    if set(train_idx) & set(test_idx):
+        raise RuntimeError("Train and test indices overlap.")
+    if len(train_idx) + len(test_idx) != len(df):
+        raise RuntimeError("Train + test do not cover the full dataset.")
 
-    rows = []
-
-    with open(file_path, "r", encoding="utf-8") as f:
-        for line_number, line in enumerate(f, start=1):
-
-            line = line.strip()
-
-            if not line:
-                continue
-
-            parts = line.split("|", maxsplit=3)
-
-            if len(parts) != 4:
-                print(
-                    f"WARNING: Could not parse {file_path.name} "
-                    f"line {line_number}: {line}"
-                )
-                continue
-
-            image_id, category, question, answer = parts
-
-            image_id = image_id.strip()
-            category = category.strip()
-            question = question.strip()
-            answer = answer.strip()
-
-            image_path = image_dir / f"{image_id}.jpg"
-
-            rows.append({
-                "image_id": image_id,
-                "question": question,
-                "answer": answer,
-                "category": category,
-                "image_path": str(image_path),
-                "source": "test",
-            })
-
-    return rows
+    if split["split_unit"] == "image":
+        shared = set(df.iloc[train_idx]["image_id"]) & set(df.iloc[test_idx]["image_id"])
+        if shared:
+            raise RuntimeError(f"{len(shared)} images occur in both train and test.")
+    return train_idx, test_idx, split
 
 
 # ============================================================
-# Category handling
+# Transforms
 # ============================================================
+class AddGaussianNoise:
+    """Additive Gaussian noise on a [0,1] tensor, applied with probability p."""
+    def __init__(self, std: float, p: float):
+        self.std, self.p = std, p
 
-def load_categories(file_path, category):
-    """
-    Read a category-specific QA file and create a mapping:
-
-        (image_id, question) -> category
-
-    These files are used only to attach category metadata.
-    They are NOT added as additional QA pairs.
-    """
-
-    category_map = {}
-
-    if not file_path.exists():
-        print(f"WARNING: Category file not found: {file_path}")
-        return category_map
-
-    with open(file_path, "r", encoding="utf-8") as f:
-        for line_number, line in enumerate(f, start=1):
-
-            line = line.strip()
-
-            if not line:
-                continue
-
-            parts = line.split("|", maxsplit=2)
-
-            if len(parts) != 3:
-                print(
-                    f"WARNING: Could not parse category file "
-                    f"{file_path.name} line {line_number}"
-                )
-                continue
-
-            image_id, question, _ = parts
-
-            key = (image_id.strip(), question.strip())
-
-            category_map[key] = category
-
-    return category_map
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        if torch.rand(1).item() < self.p:
+            x = (x + torch.randn_like(x) * self.std).clamp(0.0, 1.0)
+        return x
 
 
-def attach_categories(rows, category_maps):
-    """
-    Attach category information to train/validation rows.
-    """
+def build_transforms(cfg: Config, train: bool):
+    size = (cfg.image_size, cfg.image_size)   # [CHOICE] direct square resize
+    normalize = transforms.Normalize(cfg.imagenet_mean, cfg.imagenet_std)
+    if not train:
+        return transforms.Compose([transforms.Resize(size), transforms.ToTensor(), normalize])
 
-    for row in rows:
-
-        key = (
-            row["image_id"],
-            row["question"]
-        )
-
-        for category_map in category_maps:
-
-            if key in category_map:
-                row["category"] = category_map[key]
-                break
-
-    return rows
-
-
-# ============================================================
-# Validation
-# ============================================================
-
-def validate_dataset(df):
-    """
-    Perform basic dataset sanity checks.
-    """
-
-    print("\n========== DATASET VALIDATION ==========")
-
-    print(f"Total QA pairs: {len(df)}")
-    print(f"Unique images:  {df['image_id'].nunique()}")
-
-    print("\nQA pairs by source:")
-    print(df["source"].value_counts())
-
-    print("\nQA pairs by category:")
-    print(df["category"].value_counts(dropna=False))
-
-    # Duplicate QA pairs
-    duplicate_mask = df.duplicated(
-        subset=["image_id", "question", "answer"],
-        keep=False
-    )
-
-    duplicate_count = duplicate_mask.sum()
-
-    print(f"\nDuplicate QA rows: {duplicate_count}")
-
-    # Missing images
-    missing_images = []
-
-    for path in df["image_path"]:
-        if not Path(path).exists():
-            missing_images.append(path)
-
-    print(f"Missing image files: {len(missing_images)}")
-
-    if missing_images:
-        print("\nFirst missing images:")
-        for path in missing_images[:10]:
-            print(f"  {path}")
-
-    print("========================================\n")
-
-
-# ============================================================
-# Main dataset preparation
-# ============================================================
-
-def main():
-
-    print("========================================")
-    print("     VQA-Med Dataset Preparation")
-    print("========================================")
-
-    PROCESSED_DIR.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    # --------------------------------------------------------
-    # Check required directories/files
-    # --------------------------------------------------------
-
-    train_qa = TRAIN_DIR / "All_QA_Pairs_train.txt"
-    val_qa = VAL_DIR / "All_QA_Pairs_val.txt"
-    test_qa = TEST_DIR / "VQAMed2019_Test_Questions_w_Ref_Answers.txt"
-
-    required_paths = [
-        train_qa,
-        val_qa,
-        test_qa,
-    ]
-
-    for path in required_paths:
-        if not path.exists():
-            raise FileNotFoundError(
-                f"Required file not found:\n{path}"
-            )
-
-    # --------------------------------------------------------
-    # Parse training data
-    # --------------------------------------------------------
-
-    print("\nReading training QA pairs...")
-
-    train_rows = parse_train_val_file(
-        train_qa,
-        TRAIN_DIR / "Train_images",
-        "train"
-    )
-
-    print(f"Training QA pairs: {len(train_rows)}")
-
-    # --------------------------------------------------------
-    # Parse validation data
-    # --------------------------------------------------------
-
-    print("\nReading validation QA pairs...")
-
-    val_rows = parse_train_val_file(
-        val_qa,
-        VAL_DIR / "Val_images",
-        "validation"
-    )
-
-    print(f"Validation QA pairs: {len(val_rows)}")
-
-    # --------------------------------------------------------
-    # Parse test data
-    # --------------------------------------------------------
-
-    print("\nReading test QA pairs...")
-
-    test_rows = parse_test_file(
-        test_qa,
-        TEST_DIR / "VQAMed2019_Test_Images"
-    )
-
-    print(f"Test QA pairs: {len(test_rows)}")
-
-    # --------------------------------------------------------
-    # Load category information
-    # --------------------------------------------------------
-
-    print("\nLoading category information...")
-
-    category_maps = []
-
-    # Training categories
-    train_category_dir = TRAIN_DIR / "QAPairsByCategory"
-
-    category_maps.extend([
-        load_categories(
-            train_category_dir / "C1_Modality_train.txt",
-            "modality"
-        ),
-        load_categories(
-            train_category_dir / "C2_Plane_train.txt",
-            "plane"
-        ),
-        load_categories(
-            train_category_dir / "C3_Organ_train.txt",
-            "organ"
-        ),
-        load_categories(
-            train_category_dir / "C4_Abnormality_train.txt",
-            "abnormality"
-        ),
+    return transforms.Compose([
+        transforms.Resize(size),
+        transforms.RandomApply(
+            [transforms.ColorJitter(brightness=cfg.aug_brightness, contrast=cfg.aug_contrast)],
+            p=cfg.aug_color_p),
+        transforms.RandomApply(
+            [transforms.RandomAffine(
+                degrees=cfg.aug_rotate_deg,
+                translate=(cfg.aug_translate_px / cfg.image_size,
+                           cfg.aug_translate_px / cfg.image_size))],
+            p=cfg.aug_affine_p),
+        transforms.RandomApply(
+            [transforms.GaussianBlur(cfg.aug_blur_kernel, sigma=cfg.aug_blur_sigma)],
+            p=cfg.aug_blur_p),
+        transforms.ToTensor(),
+        AddGaussianNoise(cfg.aug_noise_std, cfg.aug_noise_p),
+        normalize,
     ])
 
-    # Validation categories
-    val_category_dir = VAL_DIR / "QAPairsByCategory"
 
-    category_maps.extend([
-        load_categories(
-            val_category_dir / "C1_Modality_val.txt",
-            "modality"
-        ),
-        load_categories(
-            val_category_dir / "C2_Plane_val.txt",
-            "plane"
-        ),
-        load_categories(
-            val_category_dir / "C3_Organ_val.txt",
-            "organ"
-        ),
-        load_categories(
-            val_category_dir / "C4_Abnormality_val.txt",
-            "abnormality"
-        ),
-    ])
+# ============================================================
+# Dataset
+# ============================================================
+class MedVQADataset(Dataset):
+    """
+    Item (dict):
+        image          float tensor [3, H, W]
+        input_ids      long tensor  [max_question_len]
+        attention_mask long tensor  [max_question_len]
+        label          long scalar: training label (canonical class); -1 if not in vocab
+        alt_ids        long tensor  [max_alts]: ids of ALL classes accepted as correct, padded with -1
+        row_idx        long scalar: row index in the CSV (for prediction logs / Grad-CAM)
+    """
+    def __init__(self, df, indices, vocab: AnswerVocab, tokenizer, cfg: Config, train: bool):
+        self.indices = list(indices)
+        self.vocab = vocab
+        self.transform = build_transforms(cfg, train)
 
-    train_rows = attach_categories(
-        train_rows,
-        category_maps
-    )
+        rows = df.iloc[self.indices]
+        self.image_paths = [PROJECT_ROOT / p for p in rows["image_path"]]
+        self.answers = rows["answer"].tolist()
 
-    val_rows = attach_categories(
-        val_rows,
-        category_maps
-    )
+        self.labels = [vocab.label(a) for a in self.answers]
+        self.accepted = [vocab.accepted_ids(a) for a in self.answers]
+        self.max_alts = max(1, max(len(x) for x in self.accepted))   # sized from data, never truncates
 
-    # --------------------------------------------------------
-    # Combine all QA pairs
-    # --------------------------------------------------------
+        enc = tokenizer(
+            rows["question"].tolist(),
+            padding="max_length", truncation=True,
+            max_length=cfg.max_question_len, return_tensors="pt")
+        self.input_ids = enc["input_ids"]
+        self.attention_mask = enc["attention_mask"]
 
-    all_rows = train_rows + val_rows + test_rows
+    def __len__(self):
+        return len(self.indices)
 
-    df = pd.DataFrame(all_rows)
+    def __getitem__(self, i):
+        image = Image.open(self.image_paths[i]).convert("RGB")   # some scans are grayscale
+        image = self.transform(image)
 
-    # Ensure consistent column order
-    df = df[
-        [
-            "image_id",
-            "question",
-            "answer",
-            "category",
-            "image_path",
-            "source",
-        ]
-    ]
+        alt_ids = torch.full((self.max_alts,), -1, dtype=torch.long)
+        acc = self.accepted[i]
+        if acc:
+            alt_ids[: len(acc)] = torch.tensor(acc)
 
-    # --------------------------------------------------------
-    # Validate
-    # --------------------------------------------------------
-
-    validate_dataset(df)
-
-    # --------------------------------------------------------
-    # Save
-    # --------------------------------------------------------
-
-    df.to_csv(
-        OUTPUT_FILE,
-        index=False,
-        encoding="utf-8"
-    )
-
-    print(f"Processed dataset saved to:")
-
-    print(OUTPUT_FILE)
-
-    print("\nDone.")
+        return {
+            "image": image,
+            "input_ids": self.input_ids[i],
+            "attention_mask": self.attention_mask[i],
+            "label": torch.tensor(self.labels[i], dtype=torch.long),
+            "alt_ids": alt_ids,
+            "row_idx": torch.tensor(self.indices[i], dtype=torch.long),
+        }
 
 
 # ============================================================
-# Entry point
+# Entry point used by training code
 # ============================================================
+def get_tokenizer(cfg: Config = CFG):
+    from transformers import AutoTokenizer
+    return AutoTokenizer.from_pretrained(cfg.bert_name)
 
-if __name__ == "__main__":
-    main()
+
+def build_datasets(cfg: Config, k: int, tokenizer=None):
+    """Return (train_ds, test_ds, vocab) for split k (1-based)."""
+    df = load_dataframe(cfg)
+    train_idx, test_idx, meta = load_split(cfg, k, df)
+    tokenizer = tokenizer or get_tokenizer(cfg)
+
+    vocab = AnswerVocab(df.iloc[train_idx]["answer"],
+                        cfg.answer_alt_separator, cfg.expand_optional_parens)
+    train_ds = MedVQADataset(df, train_idx, vocab, tokenizer, cfg, train=True)
+    test_ds = MedVQADataset(df, test_idx, vocab, tokenizer, cfg, train=False)
+
+    # sanity: every training row's own label must be among its accepted ids
+    bad = [i for i, (l, acc) in enumerate(zip(train_ds.labels, train_ds.accepted))
+           if l < 0 or l not in acc]
+    if bad:
+        raise RuntimeError(f"{len(bad)} training rows are not accepted by their own label.")
+
+    n_unseen = sum(1 for acc in test_ds.accepted if not acc)
+    n_paren = len(parenthesized_answers(df.iloc[train_idx]["answer"], cfg.answer_alt_separator))
+    print(f"[split {k}] train={len(train_ds)} test={len(test_ds)} | classes={len(vocab)} "
+          f"| distinct train answers with '(': {n_paren} "
+          f"| max accepted ids per row: train={train_ds.max_alts} test={test_ds.max_alts} "
+          f"| test rows with no accepted class in vocab: {n_unseen} ({n_unseen / len(test_ds):.1%})")
+    return train_ds, test_ds, vocab
