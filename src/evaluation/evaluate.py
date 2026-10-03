@@ -1,19 +1,20 @@
 """
-evaluate.py
+evaluate.py  (src/evaluation/evaluate.py)
 
 Evaluation engine for Medical VQA.
-Computes overall test accuracy and the exact category breakdown reported in
-Table III of the paper:
-  * Modality
-  * Plane
-  * Organ System
-  * Abnormality
+  * overall_acc / category_acc        : official VQA-Med semantics ('#' alternatives and
+                                        optional '(...)' text; correct if the predicted class is in alt_ids)
+  * strict_acc / category_strict_acc  : prediction must equal the reference's canonical
+                                        (first-alternative, literal) label
+  * unseen counts                     : test rows whose answer has no class in the vocabulary
+                                        (they can never be correct and stay in the denominator)
 """
-from typing import Dict, Any, Optional
 from collections import defaultdict
+from typing import Any, Dict, Optional
+
+import pandas as pd
 import torch
 import torch.nn as nn
-import pandas as pd
 
 from .metrics import evaluate_predictions
 
@@ -24,59 +25,42 @@ def evaluate_model(
     dataloader: torch.utils.data.DataLoader,
     df: pd.DataFrame,
     device: torch.device,
-    max_batches: Optional[int] = None
+    max_batches: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """
-    Evaluates the model across the dataloader.
-    Returns:
-        metrics: dict with overall accuracy, total count, and category breakdown.
-    """
     model.eval()
-
-    total_correct = 0
-    total_samples = 0
-
-    category_correct = defaultdict(int)
-    category_total = defaultdict(int)
+    cats = df["category"].fillna("unknown").str.lower().to_numpy()
+    total, correct, strict, unseen = (defaultdict(int) for _ in range(4))
 
     for i, batch in enumerate(dataloader):
         if max_batches is not None and i >= max_batches:
             break
+        logits = model(batch["image"].to(device), batch["input_ids"].to(device),
+                       batch["attention_mask"].to(device))
+        preds = logits.argmax(dim=-1).cpu()
+        alt_ids, labels = batch["alt_ids"], batch["label"]
 
-        images = batch["image"].to(device)
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        alt_ids = batch["alt_ids"].to(device)
-        row_indices = batch["row_idx"].tolist()
+        ok = evaluate_predictions(preds, alt_ids).tolist()               # official semantics
+        st = ((preds == labels) & (labels >= 0)).tolist()                # strict
+        un = (~(alt_ids >= 0).any(dim=1)).tolist()                       # no accepted class in vocab
 
-        # Forward pass
-        logits = model(images, input_ids, attention_mask)
-        preds = logits.argmax(dim=-1)
+        for r, o, s, u in zip(batch["row_idx"].tolist(), ok, st, un):
+            c = cats[r]
+            total[c] += 1
+            correct[c] += int(o)
+            strict[c] += int(s)
+            unseen[c] += int(u)
 
-        # Check correctness against accepted IDs (# alternatives and () expansions)
-        correct_mask = evaluate_predictions(preds, alt_ids).cpu().tolist()
-
-        for row_idx, is_correct in zip(row_indices, correct_mask):
-            cat = str(df.iloc[row_idx].get("category", "unknown")).lower()
-            total_samples += 1
-            category_total[cat] += 1
-            if is_correct:
-                total_correct += 1
-                category_correct[cat] += 1
-
-    overall_acc = (total_correct / total_samples) if total_samples > 0 else 0.0
-
-    category_acc = {}
-    for cat in sorted(category_total.keys()):
-        tot = category_total[cat]
-        corr = category_correct[cat]
-        category_acc[cat] = (corr / tot) if tot > 0 else 0.0
-
+    n = sum(total.values())
+    acc = lambda d, t: {c: d[c] / t[c] for c in sorted(t)}
     return {
-        "overall_acc": overall_acc,
-        "correct": total_correct,
-        "total": total_samples,
-        "category_acc": category_acc,
-        "category_total": dict(category_total),
-        "category_correct": dict(category_correct),
+        "overall_acc": sum(correct.values()) / n if n else 0.0,
+        "strict_acc": sum(strict.values()) / n if n else 0.0,
+        "correct": sum(correct.values()),
+        "total": n,
+        "unseen_total": sum(unseen.values()),
+        "category_acc": acc(correct, total),
+        "category_strict_acc": acc(strict, total),
+        "category_total": dict(total),
+        "category_correct": dict(correct),
+        "category_unseen": dict(unseen),
     }

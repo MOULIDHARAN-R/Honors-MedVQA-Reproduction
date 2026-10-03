@@ -8,6 +8,9 @@ Generates publication-quality Matplotlib figures from training history:
 Usage:
   python scripts/plot_results.py --split 1
 """
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 import argparse
 import json
 from pathlib import Path

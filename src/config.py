@@ -43,6 +43,8 @@ class Config:
     train_seed_offset: int = 0       # [CHOICE] training seed of split i = split_base_seed + i
     checkpoint_selection: str = "last"   # [CHOICE] report the final epoch. Picking the
                                          # best epoch by TEST accuracy would leak the test set.
+    micro_batch_size: int = 16       # [CHOICE] memory only; effective batch stays batch_size=64 (gradient accumulation)
+    grad_clip_norm: float | None = 5.0   # [CHOICE] Set to 5.0 to prevent gradient explosions (documented deviation from paper)
     use_amp: bool = False            # [CHOICE] off for the first faithful run; AMP is an optimisation, not part of the paper
     num_workers: int = 2             # [CHOICE] set 0 if Windows dataloader workers misbehave
 

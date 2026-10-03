@@ -1,52 +1,31 @@
 """
-train.py (Root CLI Entry Point)
+train.py (project root CLI)
 
-Usage:
-  # Dry-run test (runs 2 batches in ~5 seconds to verify everything)
-  python train.py --split 1 --dry_run
-
-  # Full training of Split 1 (50 epochs)
-  python train.py --split 1
-
-  # Train all 5 splits sequentially
-  python train.py --all_splits
+  python train.py --split 1 --dry_run            # 2 micro-batches, separate folder
+  python train.py --split 1                      # full run (run name: run2)
+  python train.py --split 1 --resume             # continue from checkpoints/run2/split_1/last.pt
+  python train.py --all_splits --run_name run2
 """
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 import argparse
-import sys
 from src.config import CFG
 from src.training.trainer import run_training_split
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Med-VQA Reproduction Training")
-    parser.add_argument(
-        "--split",
-        type=int,
-        default=1,
-        choices=[1, 2, 3, 4, 5],
-        help="Split number to train (1 to 5). Default: 1"
-    )
-    parser.add_argument(
-        "--all_splits",
-        action="store_true",
-        help="Train all 5 splits sequentially (1 through 5)"
-    )
-    parser.add_argument(
-        "--dry_run",
-        action="store_true",
-        help="Run 2 batches for 1 epoch to test pipeline end-to-end"
-    )
+    p = argparse.ArgumentParser(description="Med-VQA Reproduction Training")
+    p.add_argument("--split", type=int, default=1, choices=[1, 2, 3, 4, 5])
+    p.add_argument("--all_splits", action="store_true")
+    p.add_argument("--dry_run", action="store_true")
+    p.add_argument("--resume", action="store_true")
+    p.add_argument("--run_name", default="run2", help="folder name under checkpoints/ and results/")
+    a = p.parse_args()
 
-    args = parser.parse_args()
-
-    if args.all_splits:
-        splits = [1, 2, 3, 4, 5]
-        print(f"Training all 5 splits sequentially: {splits}")
-    else:
-        splits = [args.split]
-
+    splits = [1, 2, 3, 4, 5] if a.all_splits else [a.split]
     for k in splits:
-        run_training_split(split_k=k, cfg=CFG, dry_run=args.dry_run)
+        run_training_split(split_k=k, cfg=CFG, dry_run=a.dry_run, resume=a.resume, run_name=a.run_name)
 
 
 if __name__ == "__main__":
