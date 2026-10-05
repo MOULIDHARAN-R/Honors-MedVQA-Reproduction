@@ -44,7 +44,10 @@ class Config:
     checkpoint_selection: str = "last"   # [CHOICE] report the final epoch. Picking the
                                          # best epoch by TEST accuracy would leak the test set.
     micro_batch_size: int = 16       # [CHOICE] memory only; effective batch stays batch_size=64 (gradient accumulation)
-    grad_clip_norm: float | None = 5.0   # [CHOICE] Set to 5.0 to prevent gradient explosions (documented deviation from paper)
+    grad_clip_norm: float | None = 5.0   # [CHOICE, DEVIATION] clip pre-clip gradient norm to 5.0; paper mentions no clipping
+    lr_step_size: int = 5            # [CHOICE, DEVIATION] lr is multiplied by lr_gamma every lr_step_size epochs;
+                                     # the paper states lr 1e-4 and mentions no schedule
+    lr_gamma: float = 0.5            # [CHOICE, DEVIATION]
     use_amp: bool = False            # [CHOICE] off for the first faithful run; AMP is an optimisation, not part of the paper
     num_workers: int = 2             # [CHOICE] set 0 if Windows dataloader workers misbehave
 

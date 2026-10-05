@@ -1,13 +1,15 @@
 """
 python -m scripts.plot_run --run run2 --split 1             # draw once
 python -m scripts.plot_run --run run2 --split 1 --follow    # redraw after every epoch (Ctrl+C to stop)
+python -m scripts.plot_run --run run4 --all                  # draw splits 1-5 and print the final accuracies
 
 Reads  checkpoints/<run>/split_<k>/history.json   (written by the trainer after each epoch)
-Writes results/reproduction/<run>/split_<k>/plots/training_curves.png
+Writes results/reproduction/<run>/split_<k>/plots/overview.png
 It only reads history.json, so it is safe to run while training.
 """
 import argparse
 import json
+import statistics
 import time
 from pathlib import Path
 
@@ -16,6 +18,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+N_SPLITS = 5
+TOTAL_EPOCHS = 50
 PAPER_ACC = 0.60            # paper's reported overall accuracy (VQA-Med 2019)
 NAMES = {"organ": "organ system"}
 
@@ -71,13 +75,37 @@ def main():
     ap.add_argument("--run", default="run2")
     ap.add_argument("--split", type=int, default=1)
     ap.add_argument("--history", default=None, help="explicit path to a history.json")
+    ap.add_argument("--all", action="store_true", help="draw splits 1..5 once and print final accuracies")
     ap.add_argument("--follow", action="store_true", help="redraw whenever a new epoch appears")
     ap.add_argument("--interval", type=int, default=30, help="seconds between checks in --follow mode")
     a = ap.parse_args()
 
+    if a.all:
+        finals, stricts = [], []
+        for k in range(1, N_SPLITS + 1):
+            h = load(PROJECT_ROOT / "checkpoints" / a.run / f"split_{k}" / "history.json")
+            if not h:
+                print(f"split {k}: no readable history, skipped")
+                continue
+            o = PROJECT_ROOT / "results" / "reproduction" / a.run / f"split_{k}" / "plots" / "overview.png"
+            draw(h, f"Med-VQA reproduction | run {a.run} | split {k} | {len(h)} epochs", o)
+            last = h[-1]
+            note = "" if last["epoch"] == TOTAL_EPOCHS else f"   (only {last['epoch']}/{TOTAL_EPOCHS} epochs, not final)"
+            print(f"split {k}: last epoch {last['epoch']} | acc {last['test_acc']:.4f} | "
+                  f"strict {last.get('strict_acc', float('nan')):.4f}{note}\n         -> {o}")
+            finals.append(last["test_acc"])
+            if "strict_acc" in last:
+                stricts.append(last["strict_acc"])
+        if len(finals) > 1:
+            print(f"\nlast-epoch accuracy over {len(finals)} splits: "
+                  f"{statistics.mean(finals):.4f} +- {statistics.stdev(finals):.4f} (sample std)")
+            if len(stricts) == len(finals):
+                print(f"strict accuracy: {statistics.mean(stricts):.4f} +- {statistics.stdev(stricts):.4f}")
+        return
+
     hist_path = Path(a.history) if a.history else \
         PROJECT_ROOT / "checkpoints" / a.run / f"split_{a.split}" / "history.json"
-    out = PROJECT_ROOT / "results" / "reproduction" / a.run / f"split_{a.split}" / "plots" / "training_curves.png"
+    out = PROJECT_ROOT / "results" / "reproduction" / a.run / f"split_{a.split}" / "plots" / "overview.png"
 
     seen = 0
     while True:

@@ -4,8 +4,9 @@ trainer.py  (src/training/trainer.py)
 Training runner for one split.
   * Effective batch = cfg.batch_size (64) [PAPER], realised as micro-batches of
     cfg.micro_batch_size with gradient accumulation (memory only; same gradient).
-  * Adam, lr from config, 50 epochs [PAPER]. Optional gradient clipping is OFF unless
-    cfg.grad_clip_norm is set (then it is a documented deviation).
+  * Adam, 50 epochs [PAPER]. Learning rate = cfg.lr * cfg.lr_gamma ** ((epoch-1) // cfg.lr_step_size),
+    a pure function of the epoch number (safe to resume). Gradient clipping at cfg.grad_clip_norm.
+    Both the schedule and the clipping are DOCUMENTED DEVIATIONS from the paper.
   * The gradient norm is measured every optimizer step and logged per epoch.
   * Result to report = LAST-epoch accuracy. best.pt / best_acc are diagnostics selected
     on the test set and must not be reported as the result.
@@ -101,7 +102,8 @@ def run_training_split(split_k: int, cfg: Config = CFG, dry_run: bool = False,
     log(f"Device: {device} ({gpu}) | torch {torch.__version__}")
     log(f"Epochs {cfg.epochs} | effective batch {cfg.batch_size} "
         f"(micro {cfg.micro_batch_size} x {cfg.batch_size // cfg.micro_batch_size}) | lr {cfg.lr} "
-        f"| grad_clip {cfg.grad_clip_norm} | AMP {cfg.use_amp} | workers {cfg.num_workers}")
+        f"| grad_clip {cfg.grad_clip_norm} | lr x{cfg.lr_gamma} every {cfg.lr_step_size} epochs "
+        f"| AMP {cfg.use_amp} | workers {cfg.num_workers}")
     if dry_run:
         log("[DRY RUN: 2 micro-batches, 1 epoch]")
 
@@ -144,29 +146,18 @@ def run_training_split(split_k: int, cfg: Config = CFG, dry_run: bool = False,
         if history_file.exists():
             with open(history_file, "r", encoding="utf-8") as f:
                 history = json.load(f)
+            history = [r for r in history if r["epoch"] <= ckpt["epoch"]]   # drop epochs the checkpoint doesn't have
             best_acc = max((h["test_acc"] for h in history), default=0.0)
         log(f"Resumed. Next epoch {start_epoch}/{epochs}")
-
-    # ---> NEW CODE ADDED HERE <---
-    # Fix PyTorch KeyError: Tell the optimizer what its starting speed was, 
-    # since the original run didn't have a scheduler to record it!
-    for group in optimizer.param_groups:
-        group.setdefault('initial_lr', cfg.lr)
-
-    # Tell the scheduler to cut speed in half every 5 epochs. 
-    # If resuming, tell it exactly how many epochs have already passed so it calculates the correct current speed!
-    scheduler = torch.optim.lr_scheduler.StepLR(
-        optimizer, 
-        step_size=5, 
-        gamma=0.5, 
-        last_epoch=(start_epoch - 1) if resume and last_ckpt.exists() else -1
-    )
 
     start_time = time.time()
     last_eval: Dict[str, Any] = {}
 
     for epoch in range(start_epoch, epochs + 1):
         t0 = time.time()
+        lr = cfg.lr * (cfg.lr_gamma ** ((epoch - 1) // cfg.lr_step_size))
+        for g in optimizer.param_groups:
+            g["lr"] = lr
         train_loss, grad_norms = train_one_epoch(model, train_loader, criterion, optimizer,
                                                  device, epoch, cfg, max_batches)
         last_eval = evaluate_model(model, test_loader, df, device, max_batches)
@@ -179,12 +170,12 @@ def run_training_split(split_k: int, cfg: Config = CFG, dry_run: bool = False,
         gn_mean = sum(grad_norms) / len(grad_norms) if grad_norms else 0.0
 
         cat_str = " | ".join(f"{c.capitalize()}: {a:.2%}" for c, a in last_eval["category_acc"].items())
-        log(f"Epoch {epoch:02d}/{epochs:02d} [{duration:.0f}s] | loss {train_loss:.4f} "
+        log(f"Epoch {epoch:02d}/{epochs:02d} [{duration:.0f}s] | lr {lr:.1e} | loss {train_loss:.4f} "
             f"| acc {test_acc:.4f} (strict {last_eval['strict_acc']:.4f}, peak {best_acc:.4f}) "
             f"| gnorm max {gn_max:.2f} mean {gn_mean:.2f} | {cat_str}")
 
         record = {
-            "epoch": epoch, "duration_sec": duration, "train_loss": train_loss,
+            "epoch": epoch, "lr": lr, "duration_sec": duration, "train_loss": train_loss,
             "test_acc": test_acc, "strict_acc": last_eval["strict_acc"], "best_acc": best_acc,
             "grad_norm_max": gn_max, "grad_norm_mean": gn_mean,
             "category_acc": last_eval["category_acc"],
@@ -203,10 +194,6 @@ def run_training_split(split_k: int, cfg: Config = CFG, dry_run: bool = False,
                 "config": json.loads(json.dumps(asdict(cfg), default=str)),
             },
             is_best=is_best, checkpoint_dir=checkpoint_dir, filename="last.pt")
-
-        # ---> NEW CODE ADDED HERE <---
-        # Tick the clock so the scheduler knows an epoch finished and steps the learning rate
-        scheduler.step()
 
         try:
             from scripts.plot_results import plot_training_history
