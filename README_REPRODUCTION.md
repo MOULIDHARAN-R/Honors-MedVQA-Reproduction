@@ -300,88 +300,129 @@ Execute all commands from the project root (`c:\Users\mouli\Honors\MedVQA`) with
 conda activate medvqa
 ```
 
+> [!TIP]
+> **Command Notation & Generalized Parameters**:
+> * `<RUN_NAME>`: Identifies your experiment run folder under `checkpoints/` and `results/reproduction/` (e.g. `run4` for our benchmark, or custom names like `run5`, `my_reproduction`).
+> * `<SPLIT_ID>`: Integer split index `1`, `2`, `3`, `4`, or `5` (corresponding to the 5 random 80/20 image-level partitions).
+> * `<SEED>`: Integer random seed for split generation (default: `0`).
+
+---
+
 ### Step 1: Preprocess Dataset
-Verifies raw ImageCLEF XML/TXT files, cleans BOM characters, and builds canonical CSV:
+Verifies raw ImageCLEF XML/TXT files, cleans BOM characters, and builds the canonical dataset CSV:
 ```powershell
 python -m src.preprocessing
 ```
-*Output*: `data/processed/all_qa_pairs.csv` (15,292 rows, MD5: `5cbf955ad6d262b8f2382e8e48fab524`).
+* **Output**: `data/processed/all_qa_pairs.csv` (15,292 rows, MD5: `5cbf955ad6d262b8f2382e8e48fab524`).
+
+---
 
 ### Step 2: Generate 5 Image-Level Splits
-Generates 5 independent 80/20 image-level partitions (seeds 0..4):
+Partitions the dataset into 5 independent 80/20 image-level draws (seeds `<SEED>` to `<SEED> + 4`):
 ```powershell
-python scripts/split_dataset.py --split_unit image --seed 0
+python scripts/split_dataset.py --split_unit image --seed <SEED>
 ```
-*Output*: `data/splits/image/split_1.json` through `split_5.json` and `summary.json`.
+* **Output**: `data/splits/image/split_1.json` through `split_5.json` and `summary.json`.
+
+---
 
 ### Step 3: Run Fast Reproduction Smoke Test (Dry Run)
 Executes a lightweight 2 micro-batch, 1-epoch pipeline check without modifying stored results:
 ```powershell
-python train.py --split 1 --dry_run
+python train.py --split <SPLIT_ID> --dry_run
 ```
-*Output*: Checkpoint saved to `checkpoints/dry_run/split_1/` and metrics to `results/reproduction/dry_run/split_1/`. Runs 4 checkpoints remain 100% isolated.
+* **Output**: Routes to `checkpoints/dry_run/split_<SPLIT_ID>/` and `results/reproduction/dry_run/split_<SPLIT_ID>/`. Regular run checkpoints remain 100% isolated.
+
+---
 
 ### Step 4: Run Full Reproduction Training
-To train an individual split (e.g. Split 1):
-```powershell
-python train.py --split 1 --run_name run4
-```
-To train all five splits sequentially (approx. 12–16 hours total on RTX 5060):
-```powershell
-python train.py --all_splits --run_name run4
-```
-To resume an interrupted split from its latest atomic checkpoint:
-```powershell
-python train.py --split 1 --run_name run4 --resume
-```
+
+* **Train an Individual Split**:
+  ```powershell
+  python train.py --split <SPLIT_ID> --run_name <RUN_NAME>
+  ```
+
+* **Train All Five Splits Sequentially**:
+  ```powershell
+  python train.py --all_splits --run_name <RUN_NAME>
+  ```
+
+* **Resume an Interrupted Training Split**:
+  ```powershell
+  python train.py --split <SPLIT_ID> --run_name <RUN_NAME> --resume
+  ```
+* **Output**: Checkpoints saved to `checkpoints/<RUN_NAME>/split_<SPLIT_ID>/last.pt` and `best.pt`. Per-epoch histories saved to `history.json` and `train.log`.
+
+---
 
 ### Step 5: Live Training Monitoring
-Monitor loss, accuracy, and gradient norms with automatic collapse warnings:
+Monitors real-time loss, accuracy, and gradient norms with automated heuristic collapse alerts:
 ```powershell
-python -m scripts.watch_run --run run4 --split 1 --follow
+# Real-time console watch:
+python -m scripts.watch_run --run <RUN_NAME> --split <SPLIT_ID> --follow
+
+# Inspect plain text training log directly:
+python -m scripts.watch_log --log checkpoints/<RUN_NAME>/split_<SPLIT_ID>/train.log
 ```
+
+---
 
 ### Step 6: Generate Summary Results Tables
-Parses all 5 splits, computes sample standard deviations ($ddof=1$), and benchmarks against Table III:
+Aggregates all 5 splits for a run, computes sample standard deviation ($ddof=1$), and compares with Table III:
 ```powershell
-python -m scripts.summarize_run --run run4
+python -m scripts.summarize_run --run <RUN_NAME>
 ```
-*Output*: `results/reproduction/run4/results_table.md` and `results_table.csv`.
+* **Output**: `results/reproduction/<RUN_NAME>/results_table.md` and `results_table.csv`.
+
+---
 
 ### Step 7: Plot Training Dynamics & Overview Curves
-Generate 4-panel training curves (Loss, Accuracy, Categories, Gradient Norms):
+Generates 4-panel training curves (Loss, Accuracy, Categories, Gradient Norms) across splits:
 ```powershell
-python -m scripts.plot_run --run run4 --all
-python -m scripts.plot_results --split 1
+# Plot all splits summary for a run:
+python -m scripts.plot_run --run <RUN_NAME> --all
+
+# Plot detailed individual split curves:
+python -m scripts.plot_results --split <SPLIT_ID>
 ```
-*Output*: `results/reproduction/run4/split_*/plots/overview.png`.
+* **Output**: `results/reproduction/<RUN_NAME>/split_<SPLIT_ID>/plots/overview.png` and `training_curves.png`.
+
+---
 
 ### Step 8: Generate Grad-CAM Heatmaps
-Generate balanced 4-category Grad-CAM grids (2 correct, 2 incorrect per category):
+Generates category-balanced Grad-CAM visual heatmaps (correct and incorrect cases):
 ```powershell
-python -m scripts.run_gradcam --run run4 --split 1 --per_cat 2 --seed 0
+# Balanced Grad-CAM generation:
+python -m scripts.run_gradcam --run <RUN_NAME> --split <SPLIT_ID> --per_cat <COUNT> --seed <SEED>
+
+# Cross-validate against pytorch-grad-cam reference package:
+python -m scripts.run_gradcam --run <RUN_NAME> --split <SPLIT_ID> --target gt --verify_package
 ```
-To verify numerical equivalence against `pytorch-grad-cam`:
-```powershell
-python -m scripts.run_gradcam --run run4 --split 1 --target gt --verify_package
-```
-*Output*: `results/reproduction/run4/split_1/gradcam/gradcam_grid.png` and `selection.csv`.
+* **Output**: `results/reproduction/<RUN_NAME>/split_<SPLIT_ID>/gradcam/gradcam_grid.png` and `selection.csv`.
+
+---
 
 ### Step 9: Run Diagnostic Studies & Ablations
 ```powershell
-# 1. Image-blind language-prior baseline
-python experiments/blind_baseline/run_blind_baseline.py --run run4
+# 1. Modality question-type and confusion breakdown:
+python -m scripts.modality_breakdown --run <RUN_NAME>
 
-# 2. Image perturbation ablation (Real vs. Shuffled vs. Blank)
-python experiments/image_ablation/run_image_ablation.py --run run4
+# 2. Yes/No template-level wording analysis:
+python -m scripts.yesno_analysis --run <RUN_NAME>
 
-# 3. 5-Split border energy shortcut analysis
-python experiments/shortcut_analysis/run_shortcut_analysis.py --run run4
+# 3. Image-blind language-prior baseline:
+python experiments/blind_baseline/run_blind_baseline.py --run <RUN_NAME>
 
-# 4. Patient / case leakage audit
+# 4. Image perturbation ablation (Real vs. Shuffled vs. Blank scans):
+python experiments/image_ablation/run_image_ablation.py --run <RUN_NAME>
+
+# 5. Multi-split border energy shortcut analysis:
+python experiments/shortcut_analysis/run_shortcut_analysis.py --run <RUN_NAME>
+
+# 6. Patient / case leakage audit:
 python experiments/case_leakage_audit/run_case_audit.py
 
-# 5. Question-level split diagnostic runner
+# 7. Question-level split diagnostic runner:
 python experiments/diagnostic_qa_run1/train_diagnostic.py
 ```
 
@@ -483,23 +524,23 @@ MedVQA/
 
 | File | Subdirectory | Purpose | How to Run | Output Destination |
 | :--- | :--- | :--- | :--- | :--- |
-| [`train.py`](file:///c:/Users/mouli/Honors/MedVQA/train.py) | Root | Main reproduction training CLI | `python train.py --split 1 --run_name run4`<br>`python train.py --split 1 --dry_run` | `checkpoints/<run>/split_*/last.pt`<br>`results/reproduction/<run>/split_*/` |
+| [`train.py`](file:///c:/Users/mouli/Honors/MedVQA/train.py) | Root | Main reproduction training CLI | `python train.py --split <SPLIT_ID> --run_name <RUN_NAME>`<br>`python train.py --split <SPLIT_ID> --dry_run` | `checkpoints/<RUN_NAME>/split_<SPLIT_ID>/last.pt`<br>`results/reproduction/<RUN_NAME>/split_<SPLIT_ID>/` |
 | [`src/preprocessing.py`](file:///c:/Users/mouli/Honors/MedVQA/src/preprocessing.py) | `src/` | Canonical CSV generation & data cleaning | `python -m src.preprocessing` | `data/processed/all_qa_pairs.csv` |
-| [`scripts/split_dataset.py`](file:///c:/Users/mouli/Honors/MedVQA/scripts/split_dataset.py) | `scripts/` | Partitions dataset by image or QA pair | `python scripts/split_dataset.py --split_unit image --seed 0` | `data/splits/image/split_*.json` |
-| [`scripts/summarize_run.py`](file:///c:/Users/mouli/Honors/MedVQA/scripts/summarize_run.py) | `scripts/` | Aggregates 5 splits & compares to Table III | `python -m scripts.summarize_run --run run4` | `results/reproduction/<run>/results_table.md` & `.csv` |
-| [`scripts/plot_run.py`](file:///c:/Users/mouli/Honors/MedVQA/scripts/plot_run.py) | `scripts/` | Generates 4-panel training progress figures | `python -m scripts.plot_run --run run4 --all` | `results/reproduction/<run>/split_*/plots/overview.png` |
-| [`scripts/plot_results.py`](file:///c:/Users/mouli/Honors/MedVQA/scripts/plot_results.py) | `scripts/` | Plots loss & category curves | `python -m scripts.plot_results --split 1` | `results/reproduction/split_1/plots/training_curves.png` |
-| [`scripts/run_gradcam.py`](file:///c:/Users/mouli/Honors/MedVQA/scripts/run_gradcam.py) | `scripts/` | Generates Grad-CAM overlays & validates against package | `python -m scripts.run_gradcam --run run4 --split 1 --per_cat 2`<br>`python -m scripts.run_gradcam --verify_package` | `results/reproduction/<run>/split_*/gradcam/gradcam_grid.png` |
-| [`scripts/modality_breakdown.py`](file:///c:/Users/mouli/Honors/MedVQA/scripts/modality_breakdown.py) | `scripts/` | Evaluates accuracy by question type | `python -m scripts.modality_breakdown --run run4` | Console breakdown & prediction dumps |
-| [`scripts/yesno_analysis.py`](file:///c:/Users/mouli/Honors/MedVQA/scripts/yesno_analysis.py) | `scripts/` | Evaluates template-level Yes/No accuracy | `python -m scripts.yesno_analysis --run run4` | `results/reproduction/<run>/modality_breakdown/yesno_by_template.csv` |
+| [`scripts/split_dataset.py`](file:///c:/Users/mouli/Honors/MedVQA/scripts/split_dataset.py) | `scripts/` | Partitions dataset by image or QA pair | `python scripts/split_dataset.py --split_unit image --seed <SEED>` | `data/splits/image/split_*.json` |
+| [`scripts/summarize_run.py`](file:///c:/Users/mouli/Honors/MedVQA/scripts/summarize_run.py) | `scripts/` | Aggregates 5 splits & compares to Table III | `python -m scripts.summarize_run --run <RUN_NAME>` | `results/reproduction/<RUN_NAME>/results_table.md` & `.csv` |
+| [`scripts/plot_run.py`](file:///c:/Users/mouli/Honors/MedVQA/scripts/plot_run.py) | `scripts/` | Generates 4-panel training progress figures | `python -m scripts.plot_run --run <RUN_NAME> --all` | `results/reproduction/<RUN_NAME>/split_*/plots/overview.png` |
+| [`scripts/plot_results.py`](file:///c:/Users/mouli/Honors/MedVQA/scripts/plot_results.py) | `scripts/` | Plots loss & category curves | `python -m scripts.plot_results --split <SPLIT_ID>` | `results/reproduction/split_<SPLIT_ID>/plots/training_curves.png` |
+| [`scripts/run_gradcam.py`](file:///c:/Users/mouli/Honors/MedVQA/scripts/run_gradcam.py) | `scripts/` | Generates Grad-CAM overlays & validates against package | `python -m scripts.run_gradcam --run <RUN_NAME> --split <SPLIT_ID> --per_cat <COUNT>`<br>`python -m scripts.run_gradcam --run <RUN_NAME> --split <SPLIT_ID> --verify_package` | `results/reproduction/<RUN_NAME>/split_<SPLIT_ID>/gradcam/gradcam_grid.png` |
+| [`scripts/modality_breakdown.py`](file:///c:/Users/mouli/Honors/MedVQA/scripts/modality_breakdown.py) | `scripts/` | Evaluates accuracy by question type | `python -m scripts.modality_breakdown --run <RUN_NAME>` | Console breakdown & prediction dumps |
+| [`scripts/yesno_analysis.py`](file:///c:/Users/mouli/Honors/MedVQA/scripts/yesno_analysis.py) | `scripts/` | Evaluates template-level Yes/No accuracy | `python -m scripts.yesno_analysis --run <RUN_NAME>` | `results/reproduction/<RUN_NAME>/modality_breakdown/yesno_by_template.csv` |
 | [`scripts/check_accumulation.py`](file:///c:/Users/mouli/Honors/MedVQA/scripts/check_accumulation.py) | `scripts/` | Verifies micro-batch gradient accumulation | `python -m scripts.check_accumulation` | Console numerical equivalence report |
 | [`scripts/test_answers.py`](file:///c:/Users/mouli/Honors/MedVQA/scripts/test_answers.py) | `scripts/` | Unit tests for `#` and `()` answer parsing | `python -m scripts.test_answers` | Console test assertions |
 | [`scripts/smoke_test_model.py`](file:///c:/Users/mouli/Honors/MedVQA/scripts/smoke_test_model.py) | `scripts/` | Checks forward/backward pass & GPU memory | `python -m scripts.smoke_test_model` | Console verification report |
 | [`scripts/smoke_test_dataset.py`](file:///c:/Users/mouli/Honors/MedVQA/scripts/smoke_test_dataset.py) | `scripts/` | Validates dataset item shapes & classes | `python -m scripts.smoke_test_dataset` | Console item shapes & vocab head |
-| [`scripts/watch_run.py`](file:///c:/Users/mouli/Honors/MedVQA/scripts/watch_run.py) | `scripts/` | Live training monitor with collapse alerts | `python -m scripts.watch_run --run run4 --split 1 --follow` | Real-time console table |
-| [`scripts/watch_log.py`](file:///c:/Users/mouli/Honors/MedVQA/scripts/watch_log.py) | `scripts/` | Parses text training log files | `python -m scripts.watch_log --log checkpoints/run4/split_1/train.log` | Console parsed epoch metrics |
-| [`run_blind_baseline.py`](file:///c:/Users/mouli/Honors/MedVQA/experiments/blind_baseline/run_blind_baseline.py) | `experiments/blind_baseline/` | Evaluates question-only text prior | `python experiments/blind_baseline/run_blind_baseline.py --run run4` | `experiments/blind_baseline/results/blind_baseline.csv` |
-| [`run_image_ablation.py`](file:///c:/Users/mouli/Honors/MedVQA/experiments/image_ablation/run_image_ablation.py) | `experiments/image_ablation/` | Re-evaluates on Real vs. Shuffled vs. Blank scans | `python experiments/image_ablation/run_image_ablation.py --run run4` | `experiments/image_ablation/results/image_ablation.csv` |
-| [`run_shortcut_analysis.py`](file:///c:/Users/mouli/Honors/MedVQA/experiments/shortcut_analysis/run_shortcut_analysis.py) | `experiments/shortcut_analysis/` | Computes 5-split Grad-CAM border energy | `python experiments/shortcut_analysis/run_shortcut_analysis.py --run run4` | `experiments/shortcut_analysis/results/shortcut_analysis_5splits_*` |
+| [`scripts/watch_run.py`](file:///c:/Users/mouli/Honors/MedVQA/scripts/watch_run.py) | `scripts/` | Live training monitor with collapse alerts | `python -m scripts.watch_run --run <RUN_NAME> --split <SPLIT_ID> --follow` | Real-time console table |
+| [`scripts/watch_log.py`](file:///c:/Users/mouli/Honors/MedVQA/scripts/watch_log.py) | `scripts/` | Parses text training log files | `python -m scripts.watch_log --log checkpoints/<RUN_NAME>/split_<SPLIT_ID>/train.log` | Console parsed epoch metrics |
+| [`run_blind_baseline.py`](file:///c:/Users/mouli/Honors/MedVQA/experiments/blind_baseline/run_blind_baseline.py) | `experiments/blind_baseline/` | Evaluates question-only text prior | `python experiments/blind_baseline/run_blind_baseline.py --run <RUN_NAME>` | `experiments/blind_baseline/results/blind_baseline.csv` |
+| [`run_image_ablation.py`](file:///c:/Users/mouli/Honors/MedVQA/experiments/image_ablation/run_image_ablation.py) | `experiments/image_ablation/` | Re-evaluates on Real vs. Shuffled vs. Blank scans | `python experiments/image_ablation/run_image_ablation.py --run <RUN_NAME>` | `experiments/image_ablation/results/image_ablation.csv` |
+| [`run_shortcut_analysis.py`](file:///c:/Users/mouli/Honors/MedVQA/experiments/shortcut_analysis/run_shortcut_analysis.py) | `experiments/shortcut_analysis/` | Computes 5-split Grad-CAM border energy | `python experiments/shortcut_analysis/run_shortcut_analysis.py --run <RUN_NAME>` | `experiments/shortcut_analysis/results/shortcut_analysis_5splits_*` |
 | [`run_case_audit.py`](file:///c:/Users/mouli/Honors/MedVQA/experiments/case_leakage_audit/run_case_audit.py) | `experiments/case_leakage_audit/` | Inspects dataset for patient metadata | `python experiments/case_leakage_audit/run_case_audit.py` | Console audit confirmation |
 | [`train_diagnostic.py`](file:///c:/Users/mouli/Honors/MedVQA/experiments/diagnostic_qa_run1/train_diagnostic.py) | `experiments/diagnostic_qa_run1/` | Trains QA-level split model (94.6% image overlap) | `python experiments/diagnostic_qa_run1/train_diagnostic.py` | `experiments/diagnostic_qa_run1/results/` & `checkpoint/` |
