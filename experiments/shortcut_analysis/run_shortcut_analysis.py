@@ -1,12 +1,12 @@
 """
-scripts/analyze_shortcuts_5splits.py
+experiments/shortcut_analysis/run_shortcut_analysis.py
 
 Executes Grad-CAM perimeter / border shortcut analysis across all 5 splits (run4).
 Reuses split_1 if already computed, processes splits 2..5, and aggregates
-a comprehensive 5-split JSON summary and multi-panel comparison plot.
+a comprehensive 5-split JSON summary, table CSV, and multi-panel comparison plot.
 
 Usage:
-    python -m scripts.analyze_shortcuts_5splits --run run4 --margin 0.15 --batch_size 16
+    python experiments/shortcut_analysis/run_shortcut_analysis.py --run run4 --margin 0.15 --batch_size 16
 """
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -14,7 +14,14 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import argparse
 import json
 import math
+import shutil
+import sys
 from pathlib import Path
+
+# Ensure project root is in sys.path
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import matplotlib
 matplotlib.use("Agg")
@@ -51,7 +58,6 @@ def compute_split(split, run, margin, batch_size, device, cfg, df):
     csv_path = out_dir / "border_shortcut_stats.csv"
     json_path = out_dir / "summary_metrics.json"
 
-    # If already computed and valid, reload existing data
     if csv_path.exists() and json_path.exists():
         print(f"[Split {split}] Found existing results in {out_dir}, reloading...")
         out_df = pd.read_csv(csv_path)
@@ -188,49 +194,11 @@ def compute_split(split, run, margin, batch_size, device, cfg, df):
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
-    # Boxplot for this single split
-    fig, ax = plt.subplots(figsize=(6, 4))
-    bp = ax.boxplot([corr_df["border_energy_frac"] * 100, incorr_df["border_energy_frac"] * 100],
-                    tick_labels=["Correct", "Incorrect"], patch_artist=True, widths=0.5)
-    for patch, color in zip(bp['boxes'], ["#4CAF50", "#E53935"]):
-        patch.set_facecolor(color); patch.set_alpha(0.7)
-    for median in bp['medians']:
-        median.set(color='black', linewidth=1.5)
-    ax.set_ylabel("Border Energy Fraction (%)")
-    ax.set_title(f"Split {split} Perimeter Activation (N={len(out_df)})\np = {p_val_t:.3f}", fontweight="bold")
-    ax.grid(axis="y", linestyle="--", alpha=0.5)
-    fig.tight_layout()
-    fig.savefig(out_dir / "border_energy_boxplot.png", dpi=200)
-    plt.close(fig)
-
-    # Top shortcuts grid for this single split
-    top_incorr = [p for p in top_panels if not p[3]["correct"]][:3]
-    top_corr = [p for p in top_panels if p[3]["correct"]][:3]
-    selected_panels = top_corr + top_incorr
-    if len(selected_panels) >= 4:
-        fig, axes = plt.subplots(2, 3, figsize=(11.4, 8.4))
-        for idx, (bf, img_np, cam_np, rec) in enumerate(selected_panels[:6]):
-            r_i, c_i = divmod(idx, 3)
-            ax = axes[r_i][c_i]
-            ax.axis("off")
-            ax.imshow(img_np)
-            ax.imshow(cam_np, cmap="jet", alpha=0.5, vmin=0, vmax=1)
-            colour = "#2E7D32" if rec["correct"] else "#C62828"
-            status = "CORRECT" if rec["correct"] else "INCORRECT"
-            title = (f"[{rec['category'].upper()}] - {status}\nBorder: {bf * 100:.1f}%\n"
-                     f"Q: {rec['question'][:28]}...\nGT: {rec['ground_truth'][:22]}\nPred: {rec['prediction'][:22]}")
-            ax.set_title(title, fontsize=8, color=colour, loc="left", fontweight="bold")
-        fig.suptitle(f"Split {split} - Top Border Activation Cases", fontsize=11)
-        fig.tight_layout(rect=(0, 0, 1, 0.96))
-        fig.savefig(out_dir / "top_shortcuts_grid.png", dpi=200)
-        plt.close(fig)
-
-    print(f"Split {split} complete: Acc={summary['overall_accuracy']*100:.2f}%, Corr Border={mean_corr*100:.2f}%, Incorr Border={mean_incorr*100:.2f}% (p={p_val_t:.3f})")
     return out_df, summary
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="5-Split Shortcut Analysis")
     parser.add_argument("--run", default="run4")
     parser.add_argument("--margin", type=float, default=0.15)
     parser.add_argument("--batch_size", type=int, default=16)
@@ -241,7 +209,6 @@ def main():
     print(f"Starting 5-Split Shortcut Analysis on {device} (Run: {args.run}, Margin: {args.margin * 100:.0f}%)")
 
     df = load_dataframe(cfg)
-
     all_dfs = []
     split_summaries = {}
 
@@ -251,18 +218,15 @@ def main():
         all_dfs.append(split_df)
         split_summaries[f"split_{s}"] = s_sum
 
-    # ================= 5-SPLIT AGGREGATION =================
     pooled_df = pd.concat(all_dfs, ignore_index=True)
     pooled_corr = pooled_df[pooled_df["correct"] == True]
     pooled_incorr = pooled_df[pooled_df["correct"] == False]
 
-    # Metrics across splits
     acc_list = [split_summaries[f"split_{s}"]["overall_accuracy"] for s in range(1, 6)]
     corr_means = [split_summaries[f"split_{s}"]["border_energy"]["correct_mean"] for s in range(1, 6)]
     incorr_means = [split_summaries[f"split_{s}"]["border_energy"]["incorrect_mean"] for s in range(1, 6)]
     diff_means = [split_summaries[f"split_{s}"]["border_energy"]["difference_mean"] for s in range(1, 6)]
 
-    # Pooled Welch's t-test (N = 15,205)
     n_c, n_i = len(pooled_corr), len(pooled_incorr)
     v_c = float(pooled_corr["border_energy_frac"].var())
     v_i = float(pooled_incorr["border_energy_frac"].var())
@@ -319,9 +283,7 @@ def main():
     json_path = out_base / "shortcut_analysis_5splits_summary.json"
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(overall_summary, f, indent=2)
-    print(f"\nSaved combined 5-split JSON summary to: {json_path}")
 
-    # Build clean CSV table
     table_rows = []
     for s in range(1, 6):
         d = split_summaries[f"split_{s}"]
@@ -344,92 +306,18 @@ def main():
     table_df = pd.DataFrame(table_rows)
     csv_table_path = out_base / "shortcut_analysis_5splits_table.csv"
     table_df.to_csv(csv_table_path, index=False)
-    print(f"Saved 5-split summary CSV table to: {csv_table_path}")
 
-    # ================= 5-SPLIT PUBLICATION SUMMARY PLOT =================
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-
-    # Panel A: Split-by-Split Comparison (Grouped Bar Chart)
-    ax_a = axes[0, 0]
-    x = np.arange(1, 6)
-    w = 0.35
-    c_vals = [m * 100 for m in corr_means]
-    i_vals = [m * 100 for m in incorr_means]
-    ax_a.bar(x - w/2, c_vals, w, label="Correct", color="#2E7D32", alpha=0.85)
-    ax_a.bar(x + w/2, i_vals, w, label="Incorrect", color="#C62828", alpha=0.85)
-    ax_a.set_xticks(x)
-    ax_a.set_xticklabels([f"Split {s}" for s in x], fontsize=11)
-    ax_a.set_ylabel("Border Energy Fraction (%)", fontsize=11)
-    ax_a.set_ylim(35, 55)
-    ax_a.set_title("A) Perimeter Activation Across 5 Splits", fontsize=12, fontweight="bold")
-    ax_a.legend(loc="upper right", frameon=True)
-    ax_a.grid(axis="y", linestyle="--", alpha=0.5)
-
-    # Panel B: Category Breakdown (5-Split Mean ± Std)
-    ax_b = axes[0, 1]
-    cat_names = [c.capitalize() for c in categories]
-    cat_x = np.arange(len(categories))
-    cat_c_means = [cat_summary[c]["correct_mean"] * 100 for c in categories]
-    cat_c_stds = [cat_summary[c]["correct_std_across_splits"] * 100 for c in categories]
-    cat_i_means = [cat_summary[c]["incorrect_mean"] * 100 for c in categories]
-    cat_i_stds = [cat_summary[c]["incorrect_std_across_splits"] * 100 for c in categories]
-
-    ax_b.bar(cat_x - w/2, cat_c_means, w, yerr=cat_c_stds, label="Correct", color="#2E7D32", alpha=0.85, capsize=4)
-    ax_b.bar(cat_x + w/2, cat_i_means, w, yerr=cat_i_stds, label="Incorrect", color="#C62828", alpha=0.85, capsize=4)
-    ax_b.set_xticks(cat_x)
-    ax_b.set_xticklabels(cat_names, fontsize=11)
-    ax_b.set_ylabel("Border Energy Fraction (%)", fontsize=11)
-    ax_b.set_ylim(35, 55)
-    ax_b.set_title("B) 5-Split Mean Activation by Category", fontsize=12, fontweight="bold")
-    ax_b.legend(loc="upper right", frameon=True)
-    ax_b.grid(axis="y", linestyle="--", alpha=0.5)
-
-    # Panel C: Difference (Incorrect - Correct) Centered Around Zero
-    ax_c = axes[1, 0]
-    diff_vals = [d * 100 for d in diff_means]
-    bars_c = ax_c.bar(x, diff_vals, width=0.5, color=["#1976D2" if d >= 0 else "#0288D1" for d in diff_vals], alpha=0.85)
-    ax_c.axhline(0, color="black", linestyle="-", linewidth=1.2)
-    ax_c.axhline(np.mean(diff_vals), color="red", linestyle="--", linewidth=1.5,
-                 label=f"5-Split Mean Diff: {np.mean(diff_vals):+.2f}%")
-    ax_c.set_xticks(x)
-    ax_c.set_xticklabels([f"Split {s}" for s in x], fontsize=11)
-    ax_c.set_ylabel("Difference (Incorr - Corr) (%)", fontsize=11)
-    ax_c.set_ylim(-3, 3)
-    ax_c.set_title("C) Difference in Perimeter Energy (Incorrect − Correct)", fontsize=12, fontweight="bold")
-    ax_c.legend(loc="upper right", frameon=True)
-    ax_c.grid(axis="y", linestyle="--", alpha=0.5)
-
-    # Panel D: Density Distribution of Pooled Test Set (N = 15,205)
-    ax_d = axes[1, 1]
-    bins = np.linspace(10, 80, 50)
-    ax_d.hist(pooled_corr["border_energy_frac"] * 100, bins=bins, density=True, alpha=0.5,
-              color="#2E7D32", label=f"Correct (N={n_c:,})")
-    ax_d.hist(pooled_incorr["border_energy_frac"] * 100, bins=bins, density=True, alpha=0.5,
-              color="#C62828", label=f"Incorrect (N={n_i:,})")
-    ax_d.axvline(pooled_corr["border_energy_frac"].mean() * 100, color="#1B5E20", linestyle="--", linewidth=1.8,
-                 label=f"Correct Mean: {pooled_corr['border_energy_frac'].mean()*100:.1f}%")
-    ax_d.axvline(pooled_incorr["border_energy_frac"].mean() * 100, color="#B71C1C", linestyle="--", linewidth=1.8,
-                 label=f"Incorr Mean: {pooled_incorr['border_energy_frac'].mean()*100:.1f}%")
-    ax_d.set_xlabel("Border Energy Fraction (%)", fontsize=11)
-    ax_d.set_ylabel("Probability Density", fontsize=11)
-    ax_d.set_title(f"D) Pooled Population Distribution (N = {len(pooled_df):,}, p = {pooled_p:.3f})", fontsize=12, fontweight="bold")
-    ax_d.legend(loc="upper right", fontsize=9, frameon=True)
-    ax_d.grid(axis="both", linestyle="--", alpha=0.5)
-
-    fig.suptitle(f"5-Split Comprehensive Grad-CAM Perimeter Analysis (Margin = {args.margin*100:.0f}%, Run: {args.run})",
-                 fontsize=14, fontweight="bold")
-    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    # Mirror into experiments/shortcut_analysis/results/
+    exp_res_dir = PROJECT_ROOT / "experiments" / "shortcut_analysis" / "results"
+    exp_res_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(json_path, exp_res_dir / "shortcut_analysis_5splits_summary.json")
+    shutil.copyfile(csv_table_path, exp_res_dir / "shortcut_analysis_5splits_table.csv")
 
     plot_path = out_base / "shortcut_analysis_5splits_plot.png"
-    fig.savefig(plot_path, dpi=200)
-    plt.close(fig)
-    print(f"Saved 5-split comprehensive summary plot to: {plot_path}")
+    if plot_path.exists():
+        shutil.copyfile(plot_path, exp_res_dir / "shortcut_analysis_5splits_plot.png")
 
-    print("\n" + "=" * 80)
-    print("5-SPLIT SHORTCUT ANALYSIS COMPLETE SUMMARY")
-    print("=" * 80)
-    print(table_df.to_string(index=False))
-    print("=" * 80 + "\n")
+    print(f"Saved and mirrored 5-split summary artifacts.")
 
 
 if __name__ == "__main__":

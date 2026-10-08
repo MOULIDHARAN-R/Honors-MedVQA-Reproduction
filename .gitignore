@@ -9,6 +9,7 @@ env/
 
 # Jupyter
 .ipynb_checkpoints/
+notebooks/
 
 # VS Code
 .vscode/
@@ -31,6 +32,18 @@ results/
 # Environment variables
 .env
 
+# Backups and temporary files
+backups/
+scratch/
+compare_augmentations.py
+view_augmentations.py
+
+# Unwanted image files
+*.png
+*.jpg
+*.jpeg
+
 # OS files
 .DS_Store
 Thumbs.db
+

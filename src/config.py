@@ -26,13 +26,14 @@ class Config:
     splits_dir: Path = PROJECT_ROOT / "data" / "splits"
     checkpoints_dir: Path = PROJECT_ROOT / "checkpoints"
     results_dir: Path = PROJECT_ROOT / "results"
-    experiments_dir: Path = PROJECT_ROOT / "experiments" / "reproduction"
+    experiments_dir: Path = PROJECT_ROOT / "experiments"
 
     # ---------------- Splits ----------------
     split_unit: str = "image"        # [CHOICE] paper does not state the unit
     n_splits: int = 5                # [PAPER] five repeats of a random 80/20 split
     test_size: float = 0.2           # [PAPER]
     split_base_seed: int = 0         # [CHOICE] seeds 0..4; paper gives none
+    split_file_override: Path | None = None  # [DIAGNOSTIC] explicit path to a split JSON file
 
     # ---------------- Optimisation ----------------
     epochs: int = 50                 # [PAPER]
@@ -104,6 +105,8 @@ class Config:
     # ---------------- Convenience ----------------
     def split_file(self, k: int) -> Path:
         """k = 1..n_splits"""
+        if self.split_file_override is not None:
+            return Path(self.split_file_override)
         return self.splits_dir / self.split_unit / f"split_{k}.json"
 
     def checkpoint_dir(self, k: int) -> Path:
